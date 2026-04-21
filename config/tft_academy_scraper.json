@@ -1,0 +1,24 @@
+{
+  "seed_urls": [
+    "https://tftacademy.com/tierlist/comps"
+  ],
+  "request_timeout_seconds": 20,
+  "max_detail_pages": 30,
+  "user_agent": "TFTScreenStateAnalyzer/0.1 private-local-prototype",
+  "debug_html_dir": "debug/html_snapshots",
+  "selectors": {
+    "comp_card": "article, [class*='Comp'], [class*='comp-card'], [class*='tier-list'] a",
+    "detail_link": "a[href]",
+    "name": "h1, h2, h3, [class*='name'], [class*='title']",
+    "tier": "[class*='tier'], [data-tier]",
+    "patch_label": "[class*='patch']",
+    "playstyle": "[class*='playstyle'], [class*='style']",
+    "core_units": "[class*='unit'] img[alt], [class*='champion'] img[alt], [data-unit]",
+    "optional_units": "[class*='optional'] img[alt], [class*='flex'] img[alt]",
+    "carry_items": "[class*='carry'] img[alt], [class*='item'] img[alt]",
+    "tank_items": "[class*='tank'] img[alt]",
+    "augment_suggestions": "[class*='augment'] img[alt], [class*='augment']",
+    "stage_notes": "[class*='stage'], [class*='transition'], [class*='note']",
+    "tags": "[class*='tag'], [class*='badge']"
+  }
+}
