@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -58,10 +58,11 @@ class TftAcademyAdapter:
         for url in urls:
             try:
                 html = self._fetch(url)
-                page_comps = self._parse_page(html, url)
                 detail_urls = self._extract_comp_links(html, url)
-                max_detail_pages = int(self.config.get("max_detail_pages", 30))
-                for detail_url in detail_urls[:max_detail_pages]:
+                page_comps: list[NormalizedComp] = []
+                max_detail_pages = int(self.config.get("max_detail_pages", 0))
+                selected_detail_urls = detail_urls if max_detail_pages <= 0 else detail_urls[:max_detail_pages]
+                for detail_url in selected_detail_urls:
                     try:
                         detail_html = self._fetch(detail_url)
                         detail_comp = self._parse_detail_page(detail_html, detail_url)
@@ -72,9 +73,12 @@ class TftAcademyAdapter:
                     except Exception as exc:
                         LOGGER.exception("TFT Academy detail scrape failed for %s", detail_url)
                         failures.append(f"{detail_url}: {exc}")
+                if not detail_urls:
+                    page_comps = self._parse_page(html, url)
                 if not page_comps:
                     self._save_html_snapshot(url, html, "no_comps")
-                    failures.append(f"{url}: no comps parsed")
+                    if not detail_urls:
+                        failures.append(f"{url}: no comps parsed")
                 comps.extend(page_comps)
             except Exception as exc:
                 LOGGER.exception("TFT Academy scrape failed for %s", url)
@@ -123,16 +127,22 @@ class TftAcademyAdapter:
                 break
         tier = self._detail_tier(lines, name)
         stage_notes = self._stage_notes(lines)
-        alts = self._image_alts(soup)
-        core_units = [self._clean_game_asset_name(alt) for alt in alts if self._looks_like_unit(alt)]
-        items = [self._clean_game_asset_name(alt) for alt in alts if "item" in alt.lower()]
-        augments = [self._clean_game_asset_name(alt) for alt in alts if "augment" in alt.lower()]
+        core_units = self._section_asset_names(soup, "Positioning Example", "champion")
+        optional_units = self._section_asset_names(soup, "Flex Units", "champion")
+        items = self._section_asset_names(soup, "Positioning Example", "item")
+        augments = self._section_asset_names(soup, "Augment Priority", "augment")
+        if not core_units:
+            alts = self._image_alts(soup)
+            core_units = [self._clean_game_asset_name(alt) for alt in alts if self._looks_like_unit(alt)]
+            items = items or [self._clean_game_asset_name(alt) for alt in alts if "item" in alt.lower()]
+            augments = augments or [self._clean_game_asset_name(alt) for alt in alts if "augment" in alt.lower()]
         tags = self._tags_from_detail(playstyle, lines)
         fields = {
             "tier": tier,
             "patch_label": patch_label,
             "playstyle": playstyle,
             "core_units": core_units,
+            "optional_units": optional_units,
             "carry_items": items,
             "tank_items": [],
             "augment_suggestions": augments,
@@ -148,14 +158,18 @@ class TftAcademyAdapter:
             patch_label=patch_label,
             playstyle=playstyle,
             core_units=_unique(core_units),
-            optional_units=[],
+            optional_units=_unique(optional_units),
             carry_items=_unique(items),
             tank_items=[],
             augment_suggestions=_unique(augments),
             stage_notes=stage_notes,
             tags=tags,
             parse_confidence=confidence,
-            raw={"text_excerpt": " ".join(lines[:120])[:2000]},
+            raw={
+                "text_excerpt": " ".join(lines[:120])[:2000],
+                "core_units_source": "Positioning Example",
+                "optional_units_source": "Flex Units",
+            },
         )
 
     def _parse_comp_root(self, root, source_url: str, selectors: dict) -> NormalizedComp | None:  # type: ignore[no-untyped-def]
@@ -300,10 +314,10 @@ class TftAcademyAdapter:
     @staticmethod
     def _detail_tier(lines: list[str], name: str) -> str:
         for index, line in enumerate(lines):
-            if line == name and index + 1 < len(lines) and re.fullmatch(r"[SABCX]", lines[index + 1], re.IGNORECASE):
-                return lines[index + 1].upper()
-            if re.fullmatch(r"[SABCX]\s*tier", line, re.IGNORECASE):
-                return line[0].upper()
+            if line.strip().lower() == name.strip().lower() and index > 0:
+                previous = lines[index - 1].strip()
+                if re.fullmatch(r"[SABCX]", previous, re.IGNORECASE):
+                    return previous.upper()
         return ""
 
     @staticmethod
@@ -332,10 +346,67 @@ class TftAcademyAdapter:
                 values.append(alt)
         return _unique(values)
 
+    @classmethod
+    def _section_asset_names(cls, soup: BeautifulSoup, heading: str, asset_type: str) -> list[str]:
+        for text_node in soup.find_all(string=lambda value: value and value.strip() == heading):
+            ancestor = text_node.parent
+            for _ in range(8):
+                if ancestor is None:
+                    break
+                values = cls._asset_names_from_images(ancestor, asset_type)
+                if values:
+                    return values
+                ancestor = ancestor.parent
+        return []
+
+    @classmethod
+    def _asset_names_from_images(cls, root, asset_type: str) -> list[str]:  # type: ignore[no-untyped-def]
+        values: list[str] = []
+        for image in root.select("img"):
+            src = str(image.get("src", "")).strip()
+            alt = str(image.get("alt", "")).strip()
+            if asset_type == "champion" and "/champions/champion_icons/" in src:
+                name = cls._clean_game_asset_name(cls._asset_token(src))
+                if not cls._is_unit_placeholder(name):
+                    values.append(name)
+            elif asset_type == "item" and "/items/" in src:
+                values.append(cls._clean_game_asset_name(cls._asset_token(src)))
+            elif asset_type == "augment" and "/augments/" in src:
+                values.append(cls._clean_game_asset_name(alt or cls._asset_token(src)))
+        return _unique([value for value in values if value])
+
+    @staticmethod
+    def _is_unit_placeholder(name: str) -> bool:
+        normalized = name.strip().lower()
+        return bool(
+            re.fullmatch(r"lv\s*\d+", normalized)
+            or normalized
+            in {
+                "summon",
+                "relic",
+                "ivern minion",
+                "training dummy",
+                "dummy",
+                "target dummy",
+            }
+        )
+
+    @staticmethod
+    def _asset_token(src: str) -> str:
+        path = urlparse(src).path
+        return Path(path).stem
+
     @staticmethod
     def _looks_like_unit(alt: str) -> bool:
         lowered = alt.lower()
-        return lowered.startswith("tft") and "augment" not in lowered and "item" not in lowered and "academy logo" not in lowered
+        compact = re.sub(r"[^a-z0-9]+", "", lowered)
+        return (
+            lowered.startswith("tft")
+            and "augment" not in lowered
+            and "item" not in lowered
+            and "academy" not in compact
+            and "logo" not in compact
+        )
 
     @staticmethod
     def _clean_game_asset_name(value: str) -> str:

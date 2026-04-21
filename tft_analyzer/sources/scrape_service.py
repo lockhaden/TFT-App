@@ -19,6 +19,7 @@ class ScrapeService:
         result = adapter.scrape()
         count = 0
         if result.comps:
+            self.repo.delete_by_source(result.source)
             count = self.repo.upsert_comps(result.comps)
         self.repo.record_scrape_run(result.source, result.status, result.message, count, result.started_at)
         LOGGER.info(

@@ -35,10 +35,18 @@ class OcrEngine:
     def read_text(self, image_bgr: np.ndarray, whitelist: str | None = None) -> OcrResult:
         if not self.available or self._pytesseract is None:
             return OcrResult("", 0.0)
-        prepared = self._prepare(image_bgr)
-        config = "--psm 7"
+        configs = ["--psm 7", "--psm 8", "--psm 13"] if whitelist else ["--psm 6", "--psm 7"]
         if whitelist:
-            config += f" -c tessedit_char_whitelist={whitelist}"
+            configs = [f"{config} -c tessedit_char_whitelist={whitelist}" for config in configs]
+        best = OcrResult("", 0.0)
+        for prepared in self._prepare_variants(image_bgr):
+            for config in configs:
+                result = self._read_prepared(prepared, config)
+                if result.text and result.confidence >= best.confidence:
+                    best = result
+        return best
+
+    def _read_prepared(self, prepared: np.ndarray, config: str) -> OcrResult:
         try:
             data = self._pytesseract.image_to_data(
                 prepared,
@@ -65,14 +73,29 @@ class OcrEngine:
         return OcrResult(" ".join(words), sum(confidences) / len(confidences) if confidences else 0.0)
 
     @staticmethod
-    def _prepare(image_bgr: np.ndarray) -> np.ndarray:
+    def _prepare_variants(image_bgr: np.ndarray) -> list[np.ndarray]:
+        if image_bgr.size == 0:
+            return []
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        gray = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+        sharp = cv2.addWeighted(gray, 1.8, cv2.GaussianBlur(gray, (0, 0), 1.2), -0.8, 0)
+        blur = cv2.GaussianBlur(sharp, (3, 3), 0)
+        _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, inv_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        adaptive = cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            7,
+        )
+        return [sharp, otsu, inv_otsu, adaptive]
 
 
-def parse_int(result: OcrResult, min_value: int = 0, max_value: int = 999) -> tuple[int | None, float]:
+def parse_int(result: OcrResult, min_value: int = 0, max_value: int = 999, min_confidence: float = 0.12) -> tuple[int | None, float]:
+    if result.confidence < min_confidence:
+        return None, result.confidence
     match = re.search(r"\d+", result.text.replace("O", "0"))
     if not match:
         return None, 0.0

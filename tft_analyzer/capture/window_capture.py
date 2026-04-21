@@ -58,10 +58,13 @@ def capture_window(title_contains: str) -> CaptureResult:
     if not matches:
         raise RuntimeError(f"No visible window title contains '{title_contains}'")
 
-    hwnd, title = matches[0]
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    exact_matches = [match for match in matches if match[1].strip().lower() == title_contains.strip().lower()]
+    hwnd, title = exact_matches[0] if exact_matches else matches[0]
+    client_left, client_top, client_right, client_bottom = win32gui.GetClientRect(hwnd)
+    left, top = win32gui.ClientToScreen(hwnd, (client_left, client_top))
+    right, bottom = win32gui.ClientToScreen(hwnd, (client_right, client_bottom))
     if right <= left or bottom <= top:
-        raise RuntimeError(f"Window '{title}' has an invalid capture rectangle")
+        raise RuntimeError(f"Window '{title}' has an invalid client capture rectangle")
 
     image = ImageGrab.grab(bbox=(left, top, right, bottom))
     rgb = np.array(image.convert("RGB"))

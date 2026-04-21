@@ -2,27 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
+from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QComboBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QPlainTextEdit,
-    QSpinBox,
-    QSplitter,
+    QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -30,53 +27,42 @@ from PySide6.QtWidgets import (
 from tft_analyzer.analysis.analyzer import NeutralAnalyzer
 from tft_analyzer.capture.window_capture import capture_screen_region, capture_window
 from tft_analyzer.config.config_manager import ConfigManager
+from tft_analyzer.models.comp import CompCandidate, NormalizedComp
 from tft_analyzer.models.game_state import GameState
 from tft_analyzer.sources.scrape_service import ScrapeService
 from tft_analyzer.storage.comp_repository import CompRepository
+from tft_analyzer.ui.components import clear_layout
+from tft_analyzer.ui.overlay_window import OverlayWindow
+from tft_analyzer.ui.pages import (
+    AugmentsPage,
+    CompDetailsPage,
+    CompsListPage,
+    DashboardPage,
+    ItemsPage,
+    MatchHistoryPage,
+    SettingsPage,
+    TeamBuilderPage,
+    TierListPage,
+    UnitsPage,
+)
+from tft_analyzer.ui.theme import apply_theme
 from tft_analyzer.vision.state_extractor import StateExtractor
 
 LOGGER = logging.getLogger(__name__)
 
 
-class PreviewLabel(QLabel):
-    region_drawn = Signal(QRect)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(640, 360)
-        self.setStyleSheet("background:#111; color:#bbb;")
-        self._start: tuple[int, int] | None = None
-        self._current: QRect | None = None
-        self.calibration_enabled = False
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self.calibration_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self._start = (event.position().toPoint().x(), event.position().toPoint().y())
-            self._current = QRect(event.position().toPoint(), event.position().toPoint())
-            self.update()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.calibration_enabled and self._start:
-            self._current = QRect(*self._start, event.position().toPoint().x() - self._start[0], event.position().toPoint().y() - self._start[1]).normalized()
-            self.update()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self.calibration_enabled and self._current and event.button() == Qt.MouseButton.LeftButton:
-            self.region_drawn.emit(self._current.normalized())
-            self._start = None
-            self._current = None
-            self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        super().paintEvent(event)
-        if self._current:
-            painter = QPainter(self)
-            painter.setPen(QPen(Qt.GlobalColor.cyan, 2, Qt.PenStyle.DashLine))
-            painter.drawRect(self._current)
+class ScrapeNotifier(QObject):
+    finished = Signal(object, object, bool)
 
 
 class MainWindow(QMainWindow):
+    """Desktop shell/controller.
+
+    UI widgets are intentionally presentation-only. Existing capture, OCR,
+    analyzer, overlay, and scraper services stay here and push data into pages
+    through page update methods.
+    """
+
     def __init__(self, config_manager: ConfigManager) -> None:
         super().__init__()
         self.config_manager = config_manager
@@ -84,131 +70,210 @@ class MainWindow(QMainWindow):
         self.analyzer = NeutralAnalyzer()
         self.comp_repo = CompRepository(Path("cache/tft_comps.sqlite3"))
         self.scrape_service = ScrapeService(self.comp_repo, Path("config/tft_academy_scraper.json"))
-        self.current_image_bgr = None
-        self.current_state: GameState | None = None
-        self.current_pixmap: QPixmap | None = None
+        self.overlay = OverlayWindow()
 
-        self.setWindowTitle("TFT Screen State Analyzer")
+        self.current_image_bgr = None
+        self.current_pixmap: QPixmap | None = None
+        self.current_state: GameState | None = None
+        self.current_candidates: list[CompCandidate] = []
+        self.cached_comps = self.comp_repo.list_comps()
+        self.capture_in_progress = False
+        self.capture_count = 0
+        self.last_panel_update = 0.0
+        self.scrape_in_progress = False
+        self.scrape_thread: threading.Thread | None = None
+        self.scrape_notifier = ScrapeNotifier()
+        self.scrape_notifier.finished.connect(self._finish_tft_academy_refresh)
+        self.nav_buttons: dict[str, QPushButton] = {}
+
+        self.setWindowTitle("TFT Compass")
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.capture_once)
 
-        self.preview = PreviewLabel()
-        self.preview.region_drawn.connect(self._save_calibrated_region)
-        self.state_text = QPlainTextEdit()
-        self.state_text.setReadOnly(True)
-        self.analysis_text = QPlainTextEdit()
-        self.analysis_text.setReadOnly(True)
-        self.candidates_text = QPlainTextEdit()
-        self.candidates_text.setReadOnly(True)
+        self._build_shell()
+        apply_theme(self)
+        self._connect_pages()
+        self._update_cache_status()
+        self._update_comp_pages()
+        self.navigate("Dashboard")
+        QTimer.singleShot(500, self._auto_refresh_tft_academy_on_startup)
 
-        self._build_ui()
-        self._refresh_cache_status()
+    def _build_shell(self) -> None:
+        root = QWidget()
+        root.setObjectName("AppRoot")
+        shell = QHBoxLayout(root)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
 
-    def _build_ui(self) -> None:
-        capture_button = QPushButton("Capture Once")
-        capture_button.clicked.connect(self.capture_once)
-        self.auto_refresh = QCheckBox("Auto-refresh")
-        self.auto_refresh.toggled.connect(self._toggle_auto_refresh)
-        self.calibration = QCheckBox("Calibration Mode")
-        self.calibration.toggled.connect(self._toggle_calibration)
-        export_button = QPushButton("Export JSON")
-        export_button.clicked.connect(self.export_json)
-        crops_button = QPushButton("Save Debug Crops")
-        crops_button.clicked.connect(self.save_debug_crops)
-        refresh_academy_button = QPushButton("Refresh TFT Academy Data")
-        refresh_academy_button.clicked.connect(self.refresh_tft_academy_data)
-        export_comps_button = QPushButton("Export Comp Cache JSON")
-        export_comps_button.clicked.connect(self.export_comp_cache_json)
-        self.use_cached_comps = QCheckBox("Use cached comp data")
-        self.use_cached_comps.setChecked(True)
-        self.use_cached_comps.toggled.connect(self._render_analysis)
-        self.scrape_status = QLabel("Last scrape: unknown")
-        self.comp_count_label = QLabel("Cached comps: 0")
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(190)
+        side_layout = QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(12, 16, 12, 12)
+        side_layout.setSpacing(6)
+        brand = QLabel("TFT COMPASS")
+        brand.setObjectName("BrandTitle")
+        side_layout.addWidget(brand)
+        side_layout.addSpacing(16)
 
-        self.mode = QComboBox()
-        self.mode.addItems(["full_screen", "region", "window"])
-        self.mode.setCurrentText(self.config_manager.data.get("capture", {}).get("mode", "full_screen"))
-        self.window_title = QLineEdit(self.config_manager.data.get("capture", {}).get("window_title_contains", "Teamfight Tactics"))
-        self.region_inputs = [QSpinBox() for _ in range(4)]
-        for spin, value in zip(self.region_inputs, self.config_manager.data.get("capture", {}).get("region", [0, 0, 1920, 1080]), strict=False):
-            spin.setRange(0, 10000)
-            spin.setValue(int(value))
+        self.pages: dict[str, QWidget] = {}
+        self.stack = QStackedWidget()
+        self.stack.setMinimumSize(0, 0)
+        self.stack.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.dashboard_page = DashboardPage()
+        self.comps_page = CompsListPage()
+        self.comp_details_page = CompDetailsPage()
+        self.items_page = ItemsPage()
+        self.augments_page = AugmentsPage()
+        self.units_page = UnitsPage()
+        self.tier_page = TierListPage()
+        self.team_builder_page = TeamBuilderPage()
+        self.match_history_page = MatchHistoryPage()
+        self.settings_page = SettingsPage(self.config_manager.data)
 
-        self.calibration_target = QComboBox()
-        self.calibration_target.addItems(["stage", "hp", "gold", "level"])
+        for name, page in [
+            ("Dashboard", self.dashboard_page),
+            ("Comps", self.comps_page),
+            ("Comp Details", self.comp_details_page),
+            ("Items", self.items_page),
+            ("Augments", self.augments_page),
+            ("Units", self.units_page),
+            ("Tier List", self.tier_page),
+            ("Team Builder", self.team_builder_page),
+            ("Match History", self.match_history_page),
+            ("Settings", self.settings_page),
+        ]:
+            self.pages[name] = page
+            self.stack.addWidget(page)
 
-        controls = QGroupBox("Capture")
-        form = QFormLayout(controls)
-        form.addRow("Mode", self.mode)
-        form.addRow("Window title contains", self.window_title)
-        region_row = QHBoxLayout()
-        for label, spin in zip(("x", "y", "w", "h"), self.region_inputs, strict=False):
-            region_row.addWidget(QLabel(label))
-            region_row.addWidget(spin)
-        form.addRow("Region", region_row)
-        form.addRow("Calibration target", self.calibration_target)
+        for name in ["Dashboard", "Comps", "Items", "Augments", "Units", "Tier List", "Team Builder", "Match History", "Settings"]:
+            button = QPushButton(name)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.clicked.connect(lambda _=False, page_name=name: self.navigate(page_name))
+            self.nav_buttons[name] = button
+            side_layout.addWidget(button)
+        side_layout.addStretch()
+        self.sidebar_status = QLabel("TFT Academy\nunknown")
+        self.sidebar_status.setObjectName("Muted")
+        self.sidebar_status.setWordWrap(True)
+        side_layout.addWidget(self.sidebar_status)
 
-        button_row = QHBoxLayout()
-        for widget in (capture_button, self.auto_refresh, self.calibration, export_button, crops_button):
-            button_row.addWidget(widget)
-        cache_row = QHBoxLayout()
-        for widget in (refresh_academy_button, export_comps_button, self.use_cached_comps):
-            cache_row.addWidget(widget)
-        cache_status_row = QHBoxLayout()
-        cache_status_row.addWidget(self.scrape_status)
-        cache_status_row.addWidget(self.comp_count_label)
+        main = QWidget()
+        main_layout = QVBoxLayout(main)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        topbar = QWidget()
+        topbar.setObjectName("TopBar")
+        top_layout = QHBoxLayout(topbar)
+        top_layout.setContentsMargins(16, 10, 14, 10)
+        self.page_title = QLabel("Dashboard")
+        self.page_title.setObjectName("PageTitle")
+        self.page_title.setMinimumWidth(0)
+        self.patch_label = QLabel("Patch unknown")
+        self.patch_label.setObjectName("Muted")
+        self.patch_label.setMinimumWidth(0)
+        self.data_label = QLabel("Data updated: unknown")
+        self.data_label.setObjectName("Muted")
+        self.data_label.setMinimumWidth(0)
+        self.data_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.refresh_button = QPushButton("Refresh Data")
+        self.refresh_button.setObjectName("PrimaryButton")
+        self.refresh_button.clicked.connect(self.refresh_tft_academy_data)
+        top_layout.addWidget(self.page_title)
+        top_layout.addSpacing(12)
+        top_layout.addWidget(self.patch_label)
+        top_layout.addSpacing(18)
+        top_layout.addWidget(self.data_label)
+        top_layout.addStretch()
+        top_layout.addWidget(self.refresh_button)
+        for text, action in [("-", self.showMinimized), ("[]", self.showNormal), ("X", self.close)]:
+            button = QPushButton(text)
+            button.setObjectName("IconButton")
+            button.clicked.connect(action)
+            top_layout.addWidget(button)
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.addWidget(controls)
-        left_layout.addLayout(button_row)
-        left_layout.addLayout(cache_row)
-        left_layout.addLayout(cache_status_row)
-        left_layout.addWidget(self.preview, stretch=1)
+        main_layout.addWidget(topbar)
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        main_layout.addWidget(divider)
+        main_layout.addWidget(self.stack, stretch=1)
 
-        right = QSplitter(Qt.Orientation.Vertical)
-        state_group = QGroupBox("Parsed State")
-        state_layout = QVBoxLayout(state_group)
-        state_layout.addWidget(self.state_text)
-        analysis_group = QGroupBox("Analyzer Output")
-        analysis_layout = QVBoxLayout(analysis_group)
-        analysis_layout.addWidget(self.analysis_text)
-        candidates_group = QGroupBox("Top Candidate Comps")
-        candidates_layout = QVBoxLayout(candidates_group)
-        candidates_layout.addWidget(self.candidates_text)
-        right.addWidget(state_group)
-        right.addWidget(analysis_group)
-        right.addWidget(candidates_group)
+        shell.addWidget(sidebar)
+        shell.addWidget(main, stretch=1)
+        self.setCentralWidget(root)
 
-        splitter = QSplitter()
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+    def _connect_pages(self) -> None:
+        self.dashboard_page.capture_requested.connect(self.capture_once)
+        self.dashboard_page.refresh_requested.connect(self.refresh_tft_academy_data)
+        self.dashboard_page.auto_refresh_toggled.connect(self._toggle_auto_refresh)
+        self.dashboard_page.overlay_toggled.connect(self._toggle_overlay)
+        self.dashboard_page.comp_open_requested.connect(self._select_comp_by_name)
+
+        self.comps_page.comp_selected.connect(self._select_comp)
+
+        self.settings_page.capture_requested.connect(self.capture_once)
+        self.settings_page.export_requested.connect(self.export_json)
+        self.settings_page.export_comps_requested.connect(self.export_comp_cache_json)
+        self.settings_page.save_debug_requested.connect(self.save_debug_crops)
+        self.settings_page.refresh_requested.connect(self.refresh_tft_academy_data)
+        self.settings_page.overlay_toggled.connect(self._toggle_overlay)
+        self.settings_page.click_through_toggled.connect(self.overlay.set_click_through)
+        self.settings_page.opacity_changed.connect(lambda value: self.overlay.setWindowOpacity(value / 100))
+        self.settings_page.calibration_changed.connect(lambda _: self._refresh_preview_overlay())
+        self.settings_page.calibration_target_changed.connect(lambda _: self._refresh_preview_overlay())
+        self.settings_page.preview.region_drawn.connect(self._save_calibrated_region)
+        self.settings_page.refresh_interval.valueChanged.connect(self._update_refresh_interval)
+
+    def navigate(self, name: str) -> None:
+        if name not in self.pages:
+            return
+        self.stack.setCurrentWidget(self.pages[name])
+        self.page_title.setText(name)
+        for button_name, button in self.nav_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(button_name == name)
+            button.blockSignals(False)
 
     def capture_once(self) -> None:
-        self._sync_capture_config()
+        if self.capture_in_progress:
+            return
+        self.capture_in_progress = True
+        is_auto = self.dashboard_page.auto_refresh.isChecked()
+        self._sync_capture_config(save=not is_auto)
         try:
             capture = self._capture()
+            self.capture_count += 1
+            include_ocr = (
+                (not is_auto)
+                or (not self.settings_page.live_fast_mode.isChecked())
+                or self.capture_count % max(1, self.settings_page.ocr_every.value()) == 0
+            )
+            previous = self.current_state
+            self.current_image_bgr = capture.image_bgr
+            if not is_auto or self.settings_page.preview_live.isChecked():
+                self._show_preview(capture.image_bgr)
+            self.current_state = self.extractor.extract(
+                capture.image_bgr,
+                capture.source,
+                debug_dir=None,
+                include_ocr=include_ocr,
+            )
+            if previous and not include_ocr:
+                self._carry_forward_ocr(previous, self.current_state)
+            self._render_analysis(lightweight=is_auto and self.settings_page.live_fast_mode.isChecked())
         except Exception as exc:
             LOGGER.exception("Capture failed")
-            QMessageBox.warning(self, "Capture failed", str(exc))
-            return
-
-        self.current_image_bgr = capture.image_bgr
-        self._show_preview(capture.image_bgr)
-        Path("debug").mkdir(exist_ok=True)
-        cv2.imwrite(str(Path("debug") / "latest_capture.png"), capture.image_bgr)
-        self.current_state = self.extractor.extract(capture.image_bgr, capture.source, debug_dir=None)
-        self.state_text.setPlainText(json.dumps(self.current_state.to_dict(), indent=2))
-        self._render_analysis()
+            if not is_auto:
+                QMessageBox.warning(self, "Capture failed", str(exc))
+        finally:
+            self.capture_in_progress = False
 
     def _capture(self):
         capture_cfg = self.config_manager.data.setdefault("capture", {})
-        mode = capture_cfg.get("mode", "full_screen")
+        mode = capture_cfg.get("mode", "window")
         if mode == "window":
-            return capture_window(capture_cfg.get("window_title_contains", "Teamfight Tactics"))
+            return capture_window(capture_cfg.get("window_title_contains", "League of Legends (TM) Client"))
         if mode == "region":
             x, y, w, h = capture_cfg.get("region", [0, 0, 1920, 1080])
             return capture_screen_region([x, y, x + w, y + h])
@@ -219,31 +284,33 @@ class MainWindow(QMainWindow):
         h, w, ch = rgb.shape
         image = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
         self.current_pixmap = QPixmap.fromImage(image)
-        self.preview.setPixmap(self.current_pixmap.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-
-    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        super().resizeEvent(event)
-        if self.current_pixmap:
-            self.preview.setPixmap(self.current_pixmap.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.settings_page.preview.set_source_pixmap(self.current_pixmap, image_bgr.shape)
+        self._refresh_preview_overlay()
 
     def _toggle_auto_refresh(self, enabled: bool) -> None:
-        interval = int(self.config_manager.data.get("capture", {}).get("auto_refresh_ms", 2500))
-        self.timer.start(interval) if enabled else self.timer.stop()
+        if enabled:
+            self.capture_count = 0
+            self.timer.start(self.settings_page.refresh_interval.value())
+        else:
+            self.timer.stop()
 
-    def _toggle_calibration(self, enabled: bool) -> None:
-        self.preview.calibration_enabled = enabled
-
-    def _sync_capture_config(self) -> None:
-        capture_cfg = self.config_manager.data.setdefault("capture", {})
-        capture_cfg["mode"] = self.mode.currentText()
-        capture_cfg["window_title_contains"] = self.window_title.text()
-        capture_cfg["region"] = [spin.value() for spin in self.region_inputs]
+    def _update_refresh_interval(self, value: int) -> None:
+        self.config_manager.data.setdefault("capture", {})["auto_refresh_ms"] = value
         self.config_manager.save()
+        if self.dashboard_page.auto_refresh.isChecked():
+            self.timer.start(value)
+
+    def _sync_capture_config(self, save: bool = True) -> None:
+        self.config_manager.data["capture"] = self.settings_page.capture_config()
+        if save:
+            self.config_manager.save()
+        self.extractor = StateExtractor(self.config_manager.data)
 
     def _save_calibrated_region(self, rect: QRect) -> None:
         if self.current_image_bgr is None or self.current_pixmap is None:
             return
-        label_size = self.preview.size()
+        preview = self.settings_page.preview
+        label_size = preview.size()
         pixmap_size = self.current_pixmap.scaled(label_size, Qt.AspectRatioMode.KeepAspectRatio).size()
         offset_x = (label_size.width() - pixmap_size.width()) / 2
         offset_y = (label_size.height() - pixmap_size.height()) / 2
@@ -260,10 +327,149 @@ class MainWindow(QMainWindow):
         w = max(1, min(image_w - x, w))
         h = max(1, min(image_h - y, h))
         bbox = [x, y, w, h]
-        self.config_manager.data["base_resolution"] = [self.current_image_bgr.shape[1], self.current_image_bgr.shape[0]]
-        self.config_manager.set_region(self.calibration_target.currentText(), bbox)
+        self.config_manager.data["base_resolution"] = [image_w, image_h]
+        target = self.settings_page.calibration_target.currentText()
+        if target == "board_slots":
+            self._set_slot_grid(target, bbox, cols=7, rows=4, stagger=True)
+        elif target == "bench_slots":
+            self._set_slot_grid(target, bbox, cols=9, rows=1, stagger=False)
+        elif target == "item_slots":
+            self._set_slot_grid(target, bbox, cols=1, rows=10, stagger=False)
+        else:
+            self.config_manager.set_region(target, bbox)
         self.extractor = StateExtractor(self.config_manager.data)
-        QMessageBox.information(self, "Calibration saved", f"Saved {self.calibration_target.currentText()} region: {bbox}")
+        self._refresh_preview_overlay()
+        QMessageBox.information(self, "Calibration saved", f"Saved {target} region: {bbox}")
+
+    def _set_slot_grid(self, name: str, bbox: list[int], cols: int, rows: int, stagger: bool) -> None:
+        x, y, w, h = bbox
+        cell_w = w / max(cols, 1)
+        cell_h = h / max(rows, 1)
+        slots: list[dict[str, list[int]]] = []
+        for row in range(rows):
+            for col in range(cols):
+                offset = cell_w / 2 if stagger and row % 2 else 0
+                slots.append(
+                    {
+                        "bbox": [
+                            round(x + col * cell_w + offset),
+                            round(y + row * cell_h),
+                            max(1, round(cell_w * 0.82)),
+                            max(1, round(cell_h * 0.82)),
+                        ]
+                    }
+                )
+        self.config_manager.get_regions()[name] = slots
+        self.config_manager.save()
+
+    def _refresh_preview_overlay(self) -> None:
+        image_shape = self.current_image_bgr.shape if self.current_image_bgr is not None else None
+        self.settings_page.preview.set_calibration_context(
+            self.config_manager.get_regions(),
+            self.config_manager.data.get("base_resolution", [1920, 1080]),
+            image_shape,
+            self.settings_page.calibration_target.currentText(),
+            self.settings_page.calibration.isChecked(),
+        )
+
+    def refresh_tft_academy_data(self) -> None:
+        self._start_tft_academy_refresh(show_errors=True)
+
+    def _auto_refresh_tft_academy_on_startup(self) -> None:
+        self._start_tft_academy_refresh(show_errors=False)
+
+    def _start_tft_academy_refresh(self, show_errors: bool) -> None:
+        if self.scrape_in_progress:
+            return
+        self.scrape_in_progress = True
+        self.refresh_button.setEnabled(False)
+        self.dashboard_page.refresh_button.setEnabled(False)
+        self.data_label.setText("Data refresh running...")
+        self.scrape_thread = threading.Thread(target=self._run_tft_academy_refresh, args=(show_errors,), daemon=True)
+        self.scrape_thread.start()
+
+    def _run_tft_academy_refresh(self, show_errors: bool) -> None:
+        try:
+            result = self.scrape_service.refresh_tft_academy()
+            self.scrape_notifier.finished.emit(result, None, show_errors)
+        except Exception as exc:
+            LOGGER.exception("TFT Academy scrape worker failed")
+            self.scrape_notifier.finished.emit(None, exc, show_errors)
+
+    def _finish_tft_academy_refresh(self, result, exc, show_errors: bool) -> None:  # type: ignore[no-untyped-def]
+        self.scrape_in_progress = False
+        self.refresh_button.setEnabled(True)
+        self.dashboard_page.refresh_button.setEnabled(True)
+        self.scrape_thread = None
+        if exc is not None:
+            self.comp_repo.record_scrape_run("tft_academy", "failed", str(exc), 0, datetime.now().isoformat())
+            if show_errors:
+                QMessageBox.warning(self, "Scrape failed", str(exc))
+        self.cached_comps = self.comp_repo.list_comps()
+        self._update_cache_status()
+        self._update_comp_pages()
+        self._render_analysis()
+
+    def _update_cache_status(self) -> None:
+        status = self.comp_repo.last_scrape_status()
+        count = self.comp_repo.count_comps()
+        self.sidebar_status.setText(f"TFT Academy\n{status['status']}\nComps: {count}")
+        self.data_label.setText(f"Data updated: {status.get('finished_at', '') or 'unknown'}")
+        self.patch_label.setText(f"Patch {self._current_patch_label()}")
+        self.dashboard_page.update_data_status(status)
+        self.settings_page.update_data_status(status, count)
+
+    def _update_comp_pages(self) -> None:
+        self.dashboard_page.update_comps(self.cached_comps)
+        self.comps_page.update_comps(self.cached_comps)
+        self.tier_page.update_comps(self.cached_comps)
+        units = self._all_units()
+        items = self._all_items()
+        augments = self._all_augments()
+        self.units_page.update_units(units)
+        self.team_builder_page.update_units(units)
+        self.items_page.update_items(items)
+        self.augments_page.update_augments(augments)
+
+    def _render_analysis(self, lightweight: bool = False) -> None:
+        if not self.current_state:
+            self.dashboard_page.update_state(None)
+            self.dashboard_page.update_candidates([])
+            self.comps_page.update_candidates([])
+            return
+        comps = self.cached_comps if self.settings_page else []
+        candidates = self.analyzer.score_comps(self.current_state, comps) if comps else []
+        self.current_candidates = candidates
+        self.overlay.update_state(self.current_state, candidates)
+        now = time.monotonic()
+        if lightweight and now - self.last_panel_update < 1.0:
+            self.dashboard_page.update_state(self.current_state)
+            self.dashboard_page.update_candidates(candidates)
+            return
+        self.last_panel_update = now
+        self.dashboard_page.update_state(self.current_state)
+        self.dashboard_page.update_candidates(candidates)
+        self.comps_page.update_candidates(candidates)
+
+    def _select_comp_by_name(self, name: str) -> None:
+        comp = next((item for item in self.cached_comps if item.name == name), None)
+        if comp:
+            self._select_comp(comp)
+
+    def _select_comp(self, comp: NormalizedComp) -> None:
+        self.comp_details_page.update_comp(comp)
+        self.team_builder_page.update_comp(comp)
+        self.navigate("Comp Details")
+
+    def _toggle_overlay(self, enabled: bool) -> None:
+        if enabled:
+            self.overlay.update_state(self.current_state, self.current_candidates)
+            self.overlay.show()
+            self.overlay.raise_()
+        else:
+            self.overlay.hide()
+        self.dashboard_page.set_overlay_checked(enabled)
+        self.settings_page.set_overlay_checked(enabled)
 
     def export_json(self) -> None:
         if not self.current_state:
@@ -282,16 +488,6 @@ class MainWindow(QMainWindow):
         if path:
             self.comp_repo.export_json(Path(path))
 
-    def refresh_tft_academy_data(self) -> None:
-        try:
-            result = self.scrape_service.refresh_tft_academy()
-        except Exception as exc:
-            LOGGER.exception("TFT Academy refresh failed")
-            QMessageBox.warning(self, "Scrape failed", str(exc))
-            self.comp_repo.record_scrape_run("tft_academy", "failed", str(exc), 0, datetime.now().isoformat())
-        self._refresh_cache_status()
-        self._render_analysis()
-
     def save_debug_crops(self) -> None:
         if self.current_image_bgr is None:
             QMessageBox.information(self, "No screenshot", "Capture a screen before saving debug crops.")
@@ -300,36 +496,45 @@ class MainWindow(QMainWindow):
         self.extractor.save_debug_crops(self.current_image_bgr, debug_dir)
         QMessageBox.information(self, "Debug crops saved", str(debug_dir))
 
-    def _cached_comps_for_analysis(self):
-        if not self.use_cached_comps.isChecked():
-            return []
-        return self.comp_repo.list_comps()
-
-    def _render_analysis(self) -> None:
-        if not self.current_state:
-            self.analysis_text.setPlainText("")
-            self.candidates_text.setPlainText("")
-            return
-        comps = self._cached_comps_for_analysis()
-        self.analysis_text.setPlainText("\n".join(self.analyzer.analyze(self.current_state, comps)))
-        candidates = self.analyzer.score_comps(self.current_state, comps) if comps else []
-        self.candidates_text.setPlainText(self._format_candidates(candidates))
-
-    def _refresh_cache_status(self) -> None:
-        status = self.comp_repo.last_scrape_status()
-        self.scrape_status.setText(f"Last scrape: {status['status']} {status['finished_at']}")
-        self.comp_count_label.setText(f"Cached comps: {self.comp_repo.count_comps()}")
+    def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.timer.stop()
+        self.overlay.close()
+        super().closeEvent(event)
 
     @staticmethod
-    def _format_candidates(candidates) -> str:  # type: ignore[no-untyped-def]
-        if not candidates:
-            return "No cached candidate comps available."
-        lines: list[str] = []
-        for index, candidate in enumerate(candidates, start=1):
-            lines.append(f"{index}. {candidate.name}")
-            lines.append(f"   Source: {candidate.source}")
-            lines.append(f"   Score: {candidate.score:.1f} | Confidence: {candidate.confidence:.2f}")
-            lines.append("   Fit reasons: " + ("; ".join(candidate.fit_reasons) if candidate.fit_reasons else "none detected"))
-            lines.append("   Missing pieces: " + ("; ".join(candidate.missing_pieces) if candidate.missing_pieces else "none"))
-            lines.append(f"   URL: {candidate.source_url}")
-        return "\n".join(lines)
+    def _carry_forward_ocr(previous: GameState, current: GameState) -> None:
+        current.stage = previous.stage
+        current.hp = previous.hp
+        current.gold = previous.gold
+        current.level = previous.level
+        current.augments = previous.augments
+
+    def _all_units(self) -> list[str]:
+        values: list[str] = []
+        for comp in self.cached_comps:
+            values.extend(comp.core_units)
+            values.extend(comp.optional_units)
+        return sorted({value for value in values if value and not value.lower().startswith("lv")})
+
+    def _all_items(self) -> list[str]:
+        values: list[str] = []
+        for comp in self.cached_comps:
+            values.extend(comp.carry_items)
+            values.extend(comp.tank_items)
+        return sorted({value for value in values if value})
+
+    def _all_augments(self) -> list[str]:
+        values: list[str] = []
+        for comp in self.cached_comps:
+            values.extend(comp.augment_suggestions)
+        return sorted({value for value in values if value})
+
+    def _current_patch_label(self) -> str:
+        counts: dict[str, int] = {}
+        for comp in self.cached_comps:
+            patch = comp.patch_label.strip()
+            if patch:
+                counts[patch] = counts.get(patch, 0) + 1
+        if not counts:
+            return "unknown"
+        return max(counts.items(), key=lambda item: item[1])[0]

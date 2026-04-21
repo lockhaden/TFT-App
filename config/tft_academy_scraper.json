@@ -3,7 +3,7 @@
     "https://tftacademy.com/tierlist/comps"
   ],
   "request_timeout_seconds": 20,
-  "max_detail_pages": 30,
+  "max_detail_pages": 0,
   "user_agent": "TFTScreenStateAnalyzer/0.1 private-local-prototype",
   "debug_html_dir": "debug/html_snapshots",
   "selectors": {
